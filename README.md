@@ -103,9 +103,11 @@ already exist), and commit `post-review-comments.js` +
 `post-review-comments-buildkite.js` next to it. The step resolves both by
 relative path (`$PWD/buildkite/...`) at runtime.
 
-## Gotchas hit building this (all fixed in `pipeline.yml`, documented here so
+## Gotchas hit building this
+  
+(all fixed in `pipeline.yml`, documented here so
 they don't get silently reintroduced)
-
+  
 1. **`if: build.pull_request != null` fails at upload**, not at parse time —
    `build.pull_request` isn't itself a field; use
    `if: build.pull_request.id != null`. The error only surfaces on a fresh
@@ -167,3 +169,10 @@ they don't get silently reintroduced)
   Buildkite secret) gets you a distinct bot identity instead of posting as a
   human account; swapping it in only touches the `OCR_GITHUB_TOKEN` secret
   value plus a small hook, not this pipeline.
+
+
+# Contributions
+All contributions welcome. Please create a PR and tag @pooh-bear; all human reviews and merges are done on a best effort basis.
+
+# License
+MIT
