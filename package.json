@@ -1,0 +1,12 @@
+{
+  "name": "opencodereview-buildkite",
+  "private": true,
+  "description": "OpenCodeReview <-> Buildkite glue: pipeline step, GitHub posting adapter, and the vendored upstream posting helper.",
+  "scripts": {
+    "test": "node test/adapter-dryrun.test.js"
+  },
+  "devDependencies": {
+    "@octokit/rest": "^22.0.0",
+    "js-yaml": "^4.1.0"
+  }
+}

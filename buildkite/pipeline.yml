@@ -1,0 +1,144 @@
+# OpenCodeReview — Buildkite PR auto-review step.
+#
+# Add this step to any pipeline connected to a GitHub repo (alongside your
+# existing build/test steps) to review every pull request and post findings
+# back to GitHub: a sticky summary comment plus inline review comments.
+# Re-review on demand by commenting a word containing "open-code-review" on
+# the PR (see README.md for the exact trigger-word setup).
+#
+# Requires:
+#   - buildkite/post-review-comments.js and
+#     buildkite/post-review-comments-buildkite.js checked out alongside this
+#     file (same relative "buildkite/" directory in the target repo).
+#   - Two Buildkite cluster secrets, policy-restricted to this pipeline:
+#       OCR_LLM_TOKEN      LLM auth token for the OpenAI-compatible endpoint.
+#       OCR_GITHUB_TOKEN   GitHub token with pull-requests:write on the repo.
+#   - Pipeline (or step) environment variables:
+#       OCR_LLM_URL        LLM base URL, e.g. https://your-gateway/v1
+#                           (NOT the full .../chat/completions path — either
+#                           form works, but the base URL is simplest).
+#       OCR_LLM_MODEL      Model name.
+#       OCR_GITHUB_REPO    "owner/name" of the repo this pipeline builds.
+#   - GitHub pipeline settings: "Build when pull request is opened or
+#     updated" enabled, plus an Issue comment trigger (command word
+#     "open-code-review", match mode "contains") — see README.md.
+#   - The pipeline (and its agents) must live in a Buildkite CLUSTER:
+#     Buildkite secrets are cluster-scoped and are not reachable by
+#     unclustered agents ("failed to fetch secrets for job").
+#   - Agents need git >= 2.41 and a full (non-shallow) clone; Node.js is
+#     bootstrapped per-job below so the step works on any base image.
+#
+# See README.md for the full setup walkthrough and the interpolation
+# gotchas baked into this file's `$$VAR` escaping.
+
+steps:
+  - label: ":mag: OpenCodeReview"
+    key: ocr_review
+    # PR builds only (creation, update, and open-code-review comment
+    # triggers); branch builds carry no pull request context.
+    if: build.pull_request.id != null
+    agents:
+      queue: default-queue
+    env:
+      OCR_STICKY_SUMMARY: "true"
+      OCR_INCREMENTAL: "true"
+    secrets:
+      - OCR_LLM_TOKEN
+      - OCR_GITHUB_TOKEN
+    # NOTE: every runtime shell variable below is escaped as $$VAR so
+    # Buildkite's upload-time interpolation leaves it for the shell; plain
+    # $VAR would be substituted (usually to empty) when the pipeline is
+    # uploaded, since interpolation runs before the job — and its step
+    # env/secrets — even exist.
+    command: |
+      set -euo pipefail
+      echo "--- :git: Resolving review range"
+      BASE_BRANCH="$${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-$$BUILDKITE_PIPELINE_DEFAULT_BRANCH}"
+      git fetch origin "$$BASE_BRANCH"
+      MERGE_BASE=$$(git merge-base "origin/$$BASE_BRANCH" "$$BUILDKITE_COMMIT" || echo "$$BUILDKITE_COMMIT")
+      echo "Reviewing $$BUILDKITE_COMMIT from merge-base $$MERGE_BASE (base origin/$$BASE_BRANCH)"
+
+      echo "--- :node: Ensuring Node.js is installed"
+      # Agent images are not guaranteed to ship Node.js. Installed per-job
+      # (not baked into the agent image) so this step is portable across
+      # whatever base image the queue's agents run.
+      if command -v node >/dev/null 2>&1; then
+        echo "node already present: $$(node --version)"
+      elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache nodejs npm
+      elif command -v apt-get >/dev/null 2>&1; then
+        apt-get update -qq && apt-get install -y -qq nodejs npm
+      elif command -v yum >/dev/null 2>&1; then
+        yum install -y -q nodejs npm
+      elif command -v brew >/dev/null 2>&1; then
+        brew install node
+      else
+        echo "::error::no supported package manager found to install Node.js"
+        exit 1
+      fi
+      node --version
+      npm --version
+
+      echo "--- :npm: Installing OpenCodeReview"
+      export OCR_NO_UPDATE=1
+      npm install -g "@alibaba-group/open-code-review@latest"
+      ocr version
+
+      echo "--- :npm: Installing posting dependencies"
+      npm install --prefix "$$PWD/buildkite" @octokit/rest --no-save --silent
+
+      echo "--- :gear: Configuring OCR"
+      # Every llm.* key must be written through config (not left to the
+      # OCR_LLM_* env-var fallback): a config block missing even one key
+      # (e.g. no token) is "incomplete" and OCR discards the WHOLE block —
+      # including protocol/use_anthropic — falling back to the Anthropic
+      # Messages API by default, which 405s against an OpenAI-compatible
+      # gateway. auth_token_cmd (not auth_token) keeps the secret out of
+      # the on-disk config on this shared agent.
+      ocr config unset provider || true
+      ocr config set llm.url "$$OCR_LLM_URL"
+      ocr config set llm.model "$$OCR_LLM_MODEL"
+      ocr config set llm.use_anthropic false
+      ocr config set llm.protocol openai
+      ocr config set llm.auth_token ""
+      ocr config set llm.auth_token_cmd 'printf "%s" "$$OCR_LLM_TOKEN"'
+      ocr config set llm.extra_body '{"thinking": {"type": "disabled"}}'
+      ocr config set language "$${OCR_LANGUAGE:-English}"
+
+      echo "--- :mag: Reviewing"
+      mkdir -p .ocr
+      set +e
+      # (OCR_BACKGROUND folds in via a plain conditional; arrays and
+      # conditional shell parameter expansions both break Buildkite's
+      # pipeline interpolation, which parses the command string before
+      # the shell runs.)
+      OCR_ARGS="--from $$MERGE_BASE --to $$BUILDKITE_COMMIT --format json --audience agent"
+      if [ -n "$${OCR_BACKGROUND:-}" ]; then OCR_ARGS="$$OCR_ARGS --background $$OCR_BACKGROUND"; fi
+      ocr review $$OCR_ARGS --timeout "$${OCR_REVIEW_TASK_TIMEOUT:-15}" > .ocr/ocr-result.json 2> .ocr/ocr-stderr.log
+      OCR_EXIT_CODE=$$?
+      set -e
+      echo "OCR_EXIT_CODE=$$OCR_EXIT_CODE"
+      echo "=== OCR stderr (tail) ==="
+      tail -c 4000 .ocr/ocr-stderr.log || true
+
+      echo "--- :github: Posting review comments"
+      # Post even when the review failed: the adapter surfaces stderr on the
+      # PR summary, and the exit-code gate below still fails the build.
+      set +e
+      node "$$PWD/buildkite/post-review-comments-buildkite.js"
+      POST_EXIT_CODE=$$?
+      set -e
+
+      echo "--- :no_entry_sign: Gate"
+      if [ "$$OCR_EXIT_CODE" -ne 0 ]; then
+        echo "ocr review exited with code $$OCR_EXIT_CODE; see artifacts for details."
+        exit "$$OCR_EXIT_CODE"
+      fi
+      if [ "$$POST_EXIT_CODE" -ne 0 ]; then
+        echo "Posting review comments failed with code $$POST_EXIT_CODE."
+        exit "$$POST_EXIT_CODE"
+      fi
+    artifact_paths:
+      - .ocr/ocr-result.json
+      - .ocr/ocr-stderr.log
+      - .ocr/ocr-stats.json
