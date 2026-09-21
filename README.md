@@ -56,6 +56,21 @@ later enable `resolve_outdated`) on the target repo. For now a classic PAT or
 `gh auth token` works; swap in a dedicated GitHub App installation token
 later without touching the pipeline (same env var name).
 
+**Secret keys are unique per cluster**, so if another pipeline in the same
+cluster already defines `OCR_LLM_TOKEN` / `OCR_GITHUB_TOKEN`, creating these
+fails with `422 ... Key already_exists`. Store this pipeline's own key names
+and map them onto the env var names the adapter reads using the step's
+`secrets` hash — the form is `ENV_VAR: SECRET_KEY`:
+
+```yaml
+secrets:
+  OCR_LLM_TOKEN: YOURPREFIX_OCR_LLM_TOKEN
+  OCR_GITHUB_TOKEN: YOURPREFIX_OCR_GITHUB_TOKEN
+```
+
+Only the secret *keys* need prefixing; `post-review-comments-buildkite.js`
+still reads `OCR_LLM_TOKEN` / `OCR_GITHUB_TOKEN` and stays unmodified.
+
 ### 2. Pipeline environment variables
 
 Non-secret, so plain pipeline `env` (Settings → Environment Variables) is
@@ -70,10 +85,43 @@ OCR_LLM_MODEL = your-model-name
 `BUILDKITE_REPO` automatically for any `github.com` remote. Set it only if
 your pipeline's repo URL isn't a plain `github.com` URL.
 
+The dashboard is the only place that can set these — **the REST and GraphQL
+APIs cannot**. `env` in the body of `POST`/`PATCH
+/v2/organizations/{org}/pipelines` is silently ignored (the response reports
+`env: null` with no error), and neither `PipelineCreateInput` nor
+`PipelineUpdateInput` exposes an `env` field. For an API- or
+infrastructure-as-code setup, put `env` in the pipeline **configuration**
+instead, where Buildkite lifts it into the pipeline's environment:
+
+```yaml
+env:
+  OCR_LLM_URL: "https://your-llm-gateway/v1"
+  OCR_LLM_MODEL: "your-model-name"
+steps:
+  - command: "buildkite-agent pipeline upload"
+```
+
 ### 3. GitHub trigger settings (pipeline Settings → GitHub)
 
 - **Build when pull request is opened or updated** — covers `opened` +
   `synchronize`; also enable **reopened** if you want re-reviews there.
+- **Skip when pull request has existing build for commit and branch**
+  (`skip_pull_request_builds_for_existing_commits`, **enabled by default**):
+  leave this **off** if you want a review the moment a PR is opened. On an
+  in-repo PR the branch `push` build already carries the PR details, so with
+  this on the `opened` webhook is treated as a duplicate of that same
+  commit+branch and **no second build is created** — the PR then only gets
+  reviewed on the next push. Symptom: a freshly opened PR shows no build (and
+  so no review) until something is pushed to it, while re-review-on-comment
+  still works. Turn it off with:
+
+  ```bash
+  curl -X PATCH -H "Authorization: Bearer $BUILDKITE_API_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d '{"provider_settings":{"skip_pull_request_builds_for_existing_commits":false}}' \
+    "https://api.buildkite.com/v2/organizations/$ORG/pipelines/$SLUG"
+  ```
+
 - **Issue comments** (under Additional Webhooks): command word
   `open-code-review`, match mode **contains** (so `@open-code-review` or
   `/open-code-review` both work, like the upstream Action).
@@ -94,6 +142,11 @@ your pipeline's repo URL isn't a plain `github.com` URL.
   off, which is the safe default here — the pipeline definition lives in the
   repo (`buildkite/pipeline.yml`), so an untrusted fork PR that can edit it
   should never get a build in the first place.
+
+The step is gated on `if: build.pull_request.id != null`, so on **branch**
+builds it does not run and Buildkite reports it as `broken` (a false
+conditional is the documented `broken` case, distinct from `skipped`). That is
+expected, not a failure — the build itself still passes.
 
 ### 4. Copy the step into the target repo
 
@@ -151,6 +204,21 @@ they don't get silently reintroduced)
    agents happen to run (Alpine's musl libc also rules out the prebuilt
    glibc tarballs from nodejs.org — `apk add nodejs npm` is the only zero-
    config option there).
+
+7. **A newly opened PR gets no review if `skip_pull_request_builds_for_existing_commits`
+   is on (the default).** On an in-repo PR, the branch `push` build already
+   carries the PR details, so Buildkite treats the `opened` webhook as a
+   duplicate of an existing commit+branch build and creates nothing — the PR
+   only gets reviewed on the next push. `synchronize` behaves the same way by
+   design (`push` covers it), so this is specifically about `opened`. See
+   §3 for the fix.
+
+8. **Neither the REST nor the GraphQL API can set pipeline environment
+   variables.** `POST`/`PATCH /v2/organizations/{org}/pipelines` with an
+   `env` body field returns `env: null` and no error; `PipelineCreateInput`
+   and `PipelineUpdateInput` have no `env` field. Put `env` in the pipeline
+   *configuration* instead (see §2) — the dashboard's Environment Variables
+   page is editing the same thing.
 
 ## Parity gaps vs. the GitHub Action
 
