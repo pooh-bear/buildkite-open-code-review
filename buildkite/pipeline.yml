@@ -112,14 +112,46 @@ steps:
       # conditional shell parameter expansions both break Buildkite's
       # pipeline interpolation, which parses the command string before
       # the shell runs.)
-      OCR_ARGS="--from $$MERGE_BASE --to $$BUILDKITE_COMMIT --format json --audience agent"
+      OCR_RANGE="--from $$MERGE_BASE --to $$BUILDKITE_COMMIT"
+      OCR_ARGS="$$OCR_RANGE --format json --audience human --color never"
       if [ -n "$${OCR_BACKGROUND:-}" ]; then OCR_ARGS="$$OCR_ARGS --background $$OCR_BACKGROUND"; fi
-      ocr review $$OCR_ARGS --timeout "$${OCR_REVIEW_TASK_TIMEOUT:-15}" > .ocr/ocr-result.json 2> .ocr/ocr-stderr.log
-      OCR_EXIT_CODE=$$?
+      OCR_TIMEOUT="$${OCR_REVIEW_TASK_TIMEOUT:-15}"
+      echo "Model: $$OCR_LLM_MODEL  |  per-task timeout: $${OCR_TIMEOUT}m"
+      # Cheap (no LLM) listing of what is about to be reviewed, so a long
+      # run can be judged against the size of the diff.
+      ocr review $$OCR_RANGE --preview --color never || true
+
+      # --audience human streams progress lines to stderr (JSON stays on
+      # stdout). tee them into the log live so the job output shows the
+      # review advancing instead of going silent until it finishes; the
+      # adapter already tails this log for the PR summary on failure.
+      # The heartbeat prints every 60s regardless, so a quiet log with a
+      # climbing elapsed time and a byte count that stops growing is the
+      # sign of a stuck run rather than a slow one.
+      # The heartbeat's sleep gets its own stdio: killing the subshell does
+      # not kill the sleep, and an orphaned sleep still holding the job's
+      # output would linger for up to a minute after the review ends.
+      REVIEW_START=$$(date +%s)
+      : > .ocr/ocr-stderr.log
+      (
+        while sleep 60 </dev/null >/dev/null 2>&1; do
+          NOW=$$(date +%s)
+          LOG_BYTES=$$(wc -c < .ocr/ocr-stderr.log | tr -d ' ')
+          echo "[heartbeat] ocr review still running: $$(( (NOW - REVIEW_START) / 60 ))m elapsed, progress log $${LOG_BYTES} bytes"
+        done
+      ) &
+      HEARTBEAT_PID=$$!
+      trap 'kill $$HEARTBEAT_PID 2>/dev/null || true' EXIT
+      echo "Starting ocr review at $$(date -u '+%H:%M:%SZ')"
+      # A pipe (not >(tee)) so the shell waits for tee to finish writing the
+      # log before the adapter reads it. "2>&1 >file" sends only stderr
+      # down the pipe; PIPESTATUS[0] is ocr's own exit code.
+      ocr review $$OCR_ARGS --timeout "$$OCR_TIMEOUT" 2>&1 > .ocr/ocr-result.json | tee -a .ocr/ocr-stderr.log >&2
+      OCR_EXIT_CODE=$${PIPESTATUS[0]}
+      kill "$$HEARTBEAT_PID" 2>/dev/null || true
+      wait "$$HEARTBEAT_PID" 2>/dev/null || true
       set -e
-      echo "OCR_EXIT_CODE=$$OCR_EXIT_CODE"
-      echo "=== OCR stderr (tail) ==="
-      tail -c 4000 .ocr/ocr-stderr.log || true
+      echo "OCR_EXIT_CODE=$$OCR_EXIT_CODE after $$(( ($$(date +%s) - REVIEW_START) / 60 ))m"
 
       echo "--- :github: Posting review comments"
       # Post even when the review failed: the adapter surfaces stderr on the
