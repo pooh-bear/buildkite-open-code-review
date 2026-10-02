@@ -37,6 +37,26 @@
 //   BUILDKITE_BUILD_NUMBER / BUILDKITE_RETRY_COUNT
 //                               Stand-ins for the Actions runId/runAttempt
 //                               that build the per-run idempotency tags.
+//   Cross-push checkpoints (#476), all set by resolve-review-range.js via
+//   `eval "$(node buildkite/resolve-review-range.js)"` earlier in the same
+//   pipeline.yml script (empty/"full" shape when OCR_CHECKPOINT_RANGE isn't
+//   "true" — see that script's header for the full contract):
+//     OCR_CHECKPOINT_RANGE      "true"/"false" (default false). Must match
+//                               the value resolve-review-range.js was run
+//                               with, or this run's checkpoint write path
+//                               and that run's read path disagree about
+//                               whether the feature is on.
+//     RANGE_MODE / RANGE_REASON / RANGE_FROM / RANGE_TO
+//                               This run's chosen range, for the summary's
+//                               human-visible range note and same_head_noop
+//                               detection.
+//     CHECKPOINT_CARRY          The raw marker string read from the existing
+//                               summary, re-emitted verbatim on any run that
+//                               does not advance the checkpoint.
+//     CONFIG_FINGERPRINT        This run's config fingerprint, stamped into
+//                               a new checkpoint marker when the run advances.
+//     BASE_BRANCH / MERGE_BASE  This run's base ref and merge-base, stamped
+//                               into a new checkpoint marker the same way.
 
 "use strict";
 
@@ -45,6 +65,7 @@ const path = require("path");
 const { Octokit } = require("@octokit/rest");
 
 const { runPostReviewComments } = require("./post-review-comments.js");
+const { resolveRepoSlug } = require("./repo-slug.js");
 
 function parseBool(val, defaultVal) {
   if (val === undefined || val === "") return defaultVal;
@@ -54,6 +75,31 @@ function parseBool(val, defaultVal) {
 function parseNumber(val, defaultVal) {
   const n = parseFloat(val);
   return Number.isFinite(n) ? n : defaultVal;
+}
+
+// Cross-push checkpoints (#476): translates the env vars
+// resolve-review-range.js exports (via `eval "$(node
+// buildkite/resolve-review-range.js)"` earlier in the same pipeline.yml
+// script) into the checkpoint* / rangeMode arguments runPostReviewComments
+// expects. Pulled out as a pure function of `env` so it is unit-testable
+// without constructing an Octokit client or a fake PR — checkpointEnabled off
+// (the default) makes every field inert: an empty carry, empty fingerprint,
+// and rangeMode "" leave runPostReviewComments byte-identical to the
+// pre-#476 adapter.
+function checkpointOptionsFromEnv(env) {
+  return {
+    checkpointEnabled: env.OCR_CHECKPOINT_RANGE === "true",
+    checkpointCarry: env.CHECKPOINT_CARRY || "",
+    checkpointBaseRef: env.BASE_BRANCH || "",
+    checkpointMergeBase: env.MERGE_BASE || "",
+    checkpointFingerprint: env.CONFIG_FINGERPRINT || "",
+    // Nothing new was in range, so leave the previous run's summary alone
+    // instead of rewriting it into "No comments generated".
+    checkpointNoop: env.RANGE_REASON === "same_head_noop",
+    rangeMode: env.RANGE_MODE || "",
+    rangeFrom: env.RANGE_FROM || "",
+    rangeTo: env.RANGE_TO || "",
+  };
 }
 
 async function main() {
@@ -73,22 +119,12 @@ async function main() {
   // https://github.com/owner/repo.git), which Buildkite always sets for a
   // GitHub-connected pipeline — mirroring how actions/github-script derives
   // context.repo from the job's own checkout instead of a hardcoded value.
-  const deriveRepoSlug = (url) => {
-    if (!url) return null;
-    const m = /github\.com[:/]([^/]+)\/(.+?)(\.git)?$/.exec(url.trim());
-    return m ? `${m[1]}/${m[2]}` : null;
-  };
-  const repoSlug = process.env.OCR_GITHUB_REPO || deriveRepoSlug(process.env.BUILDKITE_REPO);
-  if (!repoSlug) {
-    throw new Error(
-      "Could not determine the GitHub repo: set OCR_GITHUB_REPO to \"owner/name\", " +
-        `or BUILDKITE_REPO must be a github.com URL (got: ${process.env.BUILDKITE_REPO || "(unset)"}).`
-    );
-  }
-  const [owner, repo] = repoSlug.split("/");
-  if (!owner || !repo) {
-    throw new Error(`Resolved repo slug must be "owner/name", got: ${repoSlug}`);
-  }
+  // Shared with resolve-review-range.js so both scripts resolve the same
+  // owner/repo the same way.
+  const { owner, repo } = resolveRepoSlug({
+    overrideRepo: process.env.OCR_GITHUB_REPO,
+    buildkiteRepo: process.env.BUILDKITE_REPO,
+  });
 
   const resultPath = process.env.OCR_RESULT_PATH || ".ocr/ocr-result.json";
   const stderrPath = process.env.OCR_STDERR_PATH || ".ocr/ocr-stderr.log";
@@ -109,6 +145,8 @@ async function main() {
     eventName: "pull_request_target",
     payload: {},
   };
+
+  const checkpointOptions = checkpointOptionsFromEnv(process.env);
 
   // The helper reports stats through core.setOutput (it returns undefined),
   // so capture them from the output callback into a mutable bag.
@@ -150,6 +188,7 @@ async function main() {
     routeSeverityBelow: process.env.OCR_ROUTE_SEVERITY_BELOW || "",
     routeCategories: process.env.OCR_ROUTE_CATEGORIES || "",
     resolveOutdated: process.env.OCR_RESOLVE_OUTDATED || "",
+    ...checkpointOptions,
   });
 
   // Persist the posting stats for the pipeline's job summary/annotation.
@@ -167,9 +206,16 @@ async function main() {
   return failed > 0 ? 1 : 0;
 }
 
-main()
-  .then((code) => process.exit(code))
-  .catch((err) => {
-    console.error(err && err.stack ? err.stack : err);
-    process.exit(1);
-  });
+if (require.main === module) {
+  main()
+    .then((code) => process.exit(code))
+    .catch((err) => {
+      console.error(err && err.stack ? err.stack : err);
+      process.exit(1);
+    });
+}
+
+// Exported for test/checkpoint-range.test.js: checkpointOptionsFromEnv is a
+// pure function of the environment and is worth testing without spinning up
+// main()'s Octokit client and PR-number gate.
+module.exports = { checkpointOptionsFromEnv };

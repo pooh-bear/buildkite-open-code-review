@@ -7,12 +7,28 @@
 # the PR (see README.md for the exact trigger-word setup).
 #
 # Requires:
-#   - buildkite/post-review-comments.js and
-#     buildkite/post-review-comments-buildkite.js checked out alongside this
-#     file (same relative "buildkite/" directory in the target repo).
+#   - buildkite/post-review-comments.js, buildkite/post-review-comments-buildkite.js,
+#     buildkite/resolve-review-range.js, buildkite/repo-slug.js, and
+#     buildkite/mint-installation-token.js checked out alongside this file
+#     (same relative "buildkite/" directory in the target repo).
 #   - Two Buildkite cluster secrets, policy-restricted to this pipeline:
 #       OCR_LLM_TOKEN      LLM auth token for the OpenAI-compatible endpoint.
-#       OCR_GITHUB_TOKEN   GitHub token with pull-requests:write on the repo.
+#       OCR_GITHUB_TOKEN   GitHub token with pull-requests:write on the repo
+#                          (a classic PAT — see the next bullet for a
+#                          GitHub App alternative that mints its own token
+#                          at build time instead of storing one statically).
+#   - OPTIONAL, in place of OCR_GITHUB_TOKEN: three cluster secrets that let
+#     this step mint its own short-lived installation token every run
+#     instead of reading a long-lived PAT — see README.md §1 "Option B" and
+#     §5 for full setup:
+#       GH_APP_ID                 GitHub App ID.
+#       GH_APP_INSTALLATION_ID    Installation ID for the target repo.
+#       GH_APP_PRIVATE_KEY        The App's PEM private key, full contents.
+#     When all three are present, this step mints OCR_GITHUB_TOKEN itself
+#     (buildkite/mint-installation-token.js) and OCR_GITHUB_TOKEN becomes
+#     optional; when any is missing, OCR_GITHUB_TOKEN is used as-is. Minting
+#     also gets you a distinct bot identity (a PAT posts as a human account)
+#     and is required for OCR_CHECKPOINT_RANGE to narrow anything.
 #   - Pipeline (or step) environment variables:
 #       OCR_LLM_URL        LLM base URL, e.g. https://your-gateway/v1
 #                           (NOT the full .../chat/completions path — either
@@ -42,9 +58,33 @@ steps:
     env:
       OCR_STICKY_SUMMARY: "true"
       OCR_INCREMENTAL: "true"
+      # Cross-push checkpoints (#476): "true" narrows a run that follows a
+      # complete previous review to <checkpoint>..<new head> instead of
+      # <merge-base>..<new head>. Fail-closed (see resolve-review-range.js);
+      # "false" (default, matches the upstream Action) makes every downstream
+      # RANGE_*/CHECKPOINT_* variable empty and the pipeline behaves exactly
+      # as it did before this existed.
+      #
+      # Off by default here specifically because OCR_GITHUB_TOKEN is
+      # documented above as "a PAT for now": isCheckpointAuthorOurs rejects
+      # any comment from a user.type "User" account (a PAT posts as one), so
+      # with a PAT this would always read back "author_unverified" and fail
+      # closed to a full review anyway — paying one extra listComments call
+      # per run for zero narrowing. Flip to "true" only after switching
+      # OCR_GITHUB_TOKEN to a GitHub App installation token (see README,
+      # "Parity gaps" -> posting identity), which posts as a Bot/App identity
+      # the author check accepts.
+      OCR_CHECKPOINT_RANGE: "false"
     secrets:
       - OCR_LLM_TOKEN
-      - OCR_GITHUB_TOKEN
+      # OCR_GITHUB_TOKEN is deliberately NOT listed here: unlike OCR_LLM_TOKEN,
+      # it is optional at the step level and resolved at runtime below instead
+      # (buildkite-agent secret get, guarded so a missing key never fails job
+      # startup) — either from a static OCR_GITHUB_TOKEN secret (PAT), or
+      # minted fresh from GH_APP_ID/GH_APP_INSTALLATION_ID/GH_APP_PRIVATE_KEY
+      # when all three are present. Declaring it here would make Buildkite
+      # require the key to exist in the cluster even for an App-only setup
+      # that never creates an OCR_GITHUB_TOKEN secret at all.
     # NOTE: every runtime shell variable below is escaped as $$VAR so
     # Buildkite's upload-time interpolation leaves it for the shell; plain
     # $VAR would be substituted (usually to empty) when the pipeline is
@@ -53,9 +93,9 @@ steps:
     command: |
       set -euo pipefail
       echo "--- :git: Resolving review range"
-      BASE_BRANCH="$${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-$$BUILDKITE_PIPELINE_DEFAULT_BRANCH}"
+      export BASE_BRANCH="$${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-$$BUILDKITE_PIPELINE_DEFAULT_BRANCH}"
       git fetch origin "$$BASE_BRANCH"
-      MERGE_BASE=$$(git merge-base "origin/$$BASE_BRANCH" "$$BUILDKITE_COMMIT" || echo "$$BUILDKITE_COMMIT")
+      export MERGE_BASE=$$(git merge-base "origin/$$BASE_BRANCH" "$$BUILDKITE_COMMIT" || echo "$$BUILDKITE_COMMIT")
       echo "Reviewing $$BUILDKITE_COMMIT from merge-base $$MERGE_BASE (base origin/$$BASE_BRANCH)"
 
       echo "--- :node: Ensuring Node.js is installed"
@@ -79,13 +119,76 @@ steps:
       node --version
       npm --version
 
+      echo "--- :key: Resolving OCR_GITHUB_TOKEN"
+      # Optional build-time minting (#601): if all three App secrets exist in
+      # this cluster, mint a fresh <=1h installation token instead of reading
+      # a static OCR_GITHUB_TOKEN secret — so no long-lived PAT ever has to
+      # sit in Buildkite secrets at all. `secret get` exits non-zero on a
+      # missing key (confirmed in the CLI reference) without touching
+      # anything else, so a cluster that only has OCR_GITHUB_TOKEN (no App
+      # secrets) hits every branch below as empty and falls through to the
+      # PAT path unchanged.
+      #
+      # These four `secret get` calls use fixed key names, unlike
+      # OCR_LLM_TOKEN above: that one goes through the step's declarative
+      # `secrets:` hash, which supports a prefixed key via
+      # `OCR_LLM_TOKEN: YOURPREFIX_OCR_LLM_TOKEN` (see README.md §1) when
+      # another pipeline in the same cluster already owns the bare key name.
+      # These four are looked up imperatively instead (so the mint-vs-PAT
+      # branch below can read all three App secrets before deciding), so the
+      # same prefixing need means editing the four literal key names on the
+      # next 4 lines directly — equivalent cost to editing a YAML hash, just
+      # not expressed as one.
+      GH_APP_ID="$$(buildkite-agent secret get GH_APP_ID 2>/dev/null || true)"
+      GH_APP_INSTALLATION_ID="$$(buildkite-agent secret get GH_APP_INSTALLATION_ID 2>/dev/null || true)"
+      GH_APP_PRIVATE_KEY="$$(buildkite-agent secret get GH_APP_PRIVATE_KEY 2>/dev/null || true)"
+      if [ -n "$$GH_APP_ID" ] && [ -n "$$GH_APP_INSTALLATION_ID" ] && [ -n "$$GH_APP_PRIVATE_KEY" ]; then
+        echo "Minting a GitHub App installation token (GH_APP_ID=$$GH_APP_ID, GH_APP_INSTALLATION_ID=$$GH_APP_INSTALLATION_ID)"
+        export OCR_GITHUB_TOKEN="$$(GH_APP_ID="$$GH_APP_ID" GH_APP_INSTALLATION_ID="$$GH_APP_INSTALLATION_ID" GH_APP_PRIVATE_KEY="$$GH_APP_PRIVATE_KEY" node "$$PWD/buildkite/mint-installation-token-cli.js")"
+        # The minted token is a secret this job produced itself — it never
+        # passed through `secret get`, so the agent's automatic redaction
+        # (which only covers Buildkite secrets and *_TOKEN/*_PASSWORD/etc.
+        # env-var-NAME patterns at job start) does not already cover it.
+        # Register it explicitly so it never appears in this job's own logs.
+        echo "$$OCR_GITHUB_TOKEN" | buildkite-agent redactor add
+      else
+        # No `secrets:` entry reads this automatically (see the comment on
+        # that block above) — fetched here the same way the App secrets
+        # above were just probed, for the same optionality.
+        OCR_GITHUB_TOKEN="$$(buildkite-agent secret get OCR_GITHUB_TOKEN 2>/dev/null || true)"
+        if [ -z "$$OCR_GITHUB_TOKEN" ]; then
+          echo "::error::Neither the GH_APP_* secrets (GH_APP_ID, GH_APP_INSTALLATION_ID, GH_APP_PRIVATE_KEY) nor OCR_GITHUB_TOKEN are set; cannot post review comments. Create one of the two (see README.md, \"Posting identity\")."
+          exit 1
+        fi
+        export OCR_GITHUB_TOKEN
+        echo "Using the static OCR_GITHUB_TOKEN secret"
+      fi
+      unset GH_APP_ID GH_APP_INSTALLATION_ID GH_APP_PRIVATE_KEY
+
       echo "--- :npm: Installing OpenCodeReview"
       export OCR_NO_UPDATE=1
       npm install -g "@alibaba-group/open-code-review@latest"
-      ocr version
+      # First line only, stripped of any trailing \r: fed to the checkpoint
+      # fingerprint below so an OCR upgrade invalidates a stored checkpoint.
+      # Exported (not just a local var) so it is ambient in the child `node`
+      # process resolve-review-range.js spawns.
+      export OCR_VERSION_ACTUAL="$$(ocr version 2>/dev/null | head -n1 | tr -d '\r')"
+      echo "$$OCR_VERSION_ACTUAL"
 
       echo "--- :npm: Installing posting dependencies"
       npm install --prefix "$$PWD/buildkite" @octokit/rest --no-save --silent
+
+      echo "--- :link: Resolving review range (checkpoints)"
+      # Cross-push checkpoints (#476): a run that reviewed everything it
+      # selected records the head it covered in the sticky summary; the next
+      # run reviews only <checkpoint>..<new head> instead of
+      # <merge-base>..<new head>. Fail-closed — this script never fails the
+      # job, and on any doubt it emits the "full" shape (RANGE_FROM empty),
+      # which is exactly today's range. eval'ing its stdout sets the
+      # variables directly in this shell, in scope for both `ocr review`
+      # below and the posting step at the end of this script.
+      eval "$$(node "$$PWD/buildkite/resolve-review-range.js")"
+      echo "$$RANGE_MODE ($$RANGE_REASON): from=$${RANGE_FROM:-<merge-base>} to=$$RANGE_TO"
 
       echo "--- :gear: Configuring OCR"
       # Every llm.* key must be written through config (not left to the
@@ -112,7 +215,7 @@ steps:
       # conditional shell parameter expansions both break Buildkite's
       # pipeline interpolation, which parses the command string before
       # the shell runs.)
-      OCR_RANGE="--from $$MERGE_BASE --to $$BUILDKITE_COMMIT"
+      OCR_RANGE="--from $${RANGE_FROM:-$$MERGE_BASE} --to $$BUILDKITE_COMMIT"
       OCR_ARGS="$$OCR_RANGE --format json --audience human --color never"
       if [ -n "$${OCR_BACKGROUND:-}" ]; then OCR_ARGS="$$OCR_ARGS --background $$OCR_BACKGROUND"; fi
       OCR_TIMEOUT="$${OCR_REVIEW_TASK_TIMEOUT:-15}"

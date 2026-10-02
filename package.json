@@ -1,9 +1,10 @@
 {
   "name": "opencodereview-buildkite",
   "private": true,
+  "license": "MIT",
   "description": "OpenCodeReview <-> Buildkite glue: pipeline step, GitHub posting adapter, and the vendored upstream posting helper.",
   "scripts": {
-    "test": "node test/adapter-dryrun.test.js"
+    "test": "node test/adapter-dryrun.test.js && node test/checkpoint-range.test.js && node test/mint-installation-token.test.js"
   },
   "devDependencies": {
     "@octokit/rest": "^22.0.0",

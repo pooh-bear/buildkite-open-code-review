@@ -11,57 +11,9 @@ const assert = require("assert");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { spawnSync } = require("child_process");
 
 const ROOT = path.resolve(__dirname, "..");
-const ADAPTER = path.join(ROOT, "buildkite", "post-review-comments-buildkite.js");
-
-function makeStubServer() {
-  const state = {
-    issueComments: [],
-    reviews: [],
-    rateLimitRemaining: 4999,
-  };
-  let nextId = 1;
-
-  const github = {
-    rest: {
-      issues: {
-        listComments: async () => ({
-          data: state.issueComments.map((c) => ({ ...c })),
-          headers: { "x-ratelimit-remaining": String(state.rateLimitRemaining) },
-        }),
-        createComment: async ({ body }) => {
-          const c = { id: nextId++, body, html_url: `https://github.example/c/${nextId - 1}` };
-          state.issueComments.push(c);
-          return { data: c, headers: {} };
-        },
-        updateComment: async ({ comment_id, body }) => {
-          const c = state.issueComments.find((x) => x.id === comment_id);
-          if (!c) throw Object.assign(new Error("404 not found"), { status: 404 });
-          c.body = body;
-          return { data: c, headers: {} };
-        },
-      },
-      pulls: {
-        createReview: async ({ body, comments }) => {
-          const r = { id: nextId++, body, comments };
-          state.reviews.push(r);
-          return { data: r, headers: { "x-ratelimit-remaining": String(--state.rateLimitRemaining) } };
-        },
-        listReviews: async () => ({ data: [], headers: {} }),
-        listReviewComments: async () => ({ data: [], headers: {} }),
-        listFiles: async () => ({ data: [], headers: {} }),
-        get: async () => ({ data: { head: { sha: "0123456789abcdef0123456789abcdef01234567" } }, headers: {} }),
-      },
-      users: {
-        getAuthenticated: async () => ({ data: { login: "ocr-bot" }, headers: {} }),
-      },
-    },
-    graphql: async () => ({ repository: { pullRequest: { reviewThreads: { nodes: [] } } } }),
-  };
-  return { github, state };
-}
+const { makeStubServer } = require("./stub-github.js");
 
 // Run the adapter as a child process with a stubbed API? The adapter builds
 // its own Octokit, so instead test the composition directly: load the helper
